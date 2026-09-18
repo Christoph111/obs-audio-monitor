@@ -20,6 +20,12 @@
 #define DRIFT_WINDOW_10M_NS 600000000000ULL
 #define AUDIO_QUEUE_BUFFER_COUNT 8
 #define AUDIO_QUEUE_MIN_BUFFER_COUNT 2
+#define RESAMPLE_CONTROL_SETTLE_NS 60000000000ULL
+#define RESAMPLE_CONTROL_INTERVAL_NS 10000000000ULL
+#define RESAMPLE_CONTROL_SMOOTHING_SEC 10.0
+#define RESAMPLE_TARGET_TOTAL_MS 180.0
+#define RESAMPLE_RAMP_STEP_HZ 1
+#define RESAMPLE_MAX_ADJUST_HZ 8
 
 struct drift_window {
 	uint64_t duration_ns;
@@ -55,7 +61,15 @@ struct audio_monitor {
 	uint32_t channels;
 	uint32_t sample_rate;
 	uint32_t device_sample_rate;
+	enum speaker_layout speakers;
 	audio_resampler_t *resampler;
+	int resample_adjust_hz;
+	uint64_t resampler_reconfigs;
+	uint64_t resampler_reconfig_failures;
+	uint64_t resample_control_start_ns;
+	uint64_t resample_control_last_ns;
+	uint64_t last_resample_adjust_ns;
+	double resample_control_total_ms;
 	float volume;
 	bool mono;
 	float balance;
@@ -292,6 +306,157 @@ static double bytes_to_ms(const struct audio_monitor *monitor, size_t bytes)
 			    (uint64_t)(bytes / monitor->bytes_per_frame));
 }
 
+static double resample_adjust_ppm(const struct audio_monitor *monitor)
+{
+	if (!monitor->sample_rate)
+		return 0.0;
+
+	return (double)monitor->resample_adjust_hz * 1000000.0 /
+	       (double)monitor->sample_rate;
+}
+
+static bool create_resampler(struct audio_monitor *monitor, int adjust_hz)
+{
+	if (!monitor->sample_rate)
+		return false;
+
+	const int output_sample_rate = (int)monitor->sample_rate + adjust_hz;
+	if (output_sample_rate < 1)
+		return false;
+	const bool replacing = monitor->resampler != NULL;
+
+	struct resample_info from = {.samples_per_sec = monitor->sample_rate,
+				     .speakers = monitor->speakers,
+				     .format = AUDIO_FORMAT_FLOAT_PLANAR};
+	struct resample_info to = {.samples_per_sec =
+					   (uint32_t)output_sample_rate,
+				   .speakers = monitor->speakers,
+				   .format = AUDIO_FORMAT_FLOAT};
+
+	audio_resampler_t *resampler = audio_resampler_create(&to, &from);
+	if (!resampler) {
+		monitor->resampler_reconfig_failures++;
+		blog(LOG_WARNING,
+		     "AudioMonitorDriftEvent event=\"resample_adjust_failed\" "
+		     "device=\"%s\" id=\"%s\" source=\"%s\" adjust_hz=%d "
+		     "output_sample_rate=%d failures=%llu",
+		     monitor->device_name ? monitor->device_name : "",
+		     monitor->device_id ? monitor->device_id : "",
+		     monitor->source_name ? monitor->source_name : "", adjust_hz,
+		     output_sample_rate,
+		     (unsigned long long)monitor
+			     ->resampler_reconfig_failures);
+		return false;
+	}
+
+	audio_resampler_destroy(monitor->resampler);
+	monitor->resampler = resampler;
+	monitor->resample_adjust_hz = adjust_hz;
+	if (replacing)
+		monitor->resampler_reconfigs++;
+	return true;
+}
+
+static int desired_resample_adjust_hz(const struct audio_monitor *monitor)
+{
+	const double total_ms = monitor->resample_control_total_ms;
+
+	if (total_ms < 90.0)
+		return 8;
+	if (total_ms < 120.0)
+		return 6;
+	if (total_ms < 150.0)
+		return 4;
+	if (total_ms < 165.0)
+		return 2;
+	if (total_ms > 300.0)
+		return -8;
+	if (total_ms > 270.0)
+		return -6;
+	if (total_ms > 240.0)
+		return -4;
+	if (total_ms > 220.0)
+		return -2;
+
+	return 0;
+}
+
+static int ramp_resample_adjust_hz(int current, int desired)
+{
+	if (desired > RESAMPLE_MAX_ADJUST_HZ)
+		desired = RESAMPLE_MAX_ADJUST_HZ;
+	else if (desired < -RESAMPLE_MAX_ADJUST_HZ)
+		desired = -RESAMPLE_MAX_ADJUST_HZ;
+
+	if (desired > current)
+		return current + RESAMPLE_RAMP_STEP_HZ;
+	if (desired < current)
+		return current - RESAMPLE_RAMP_STEP_HZ;
+
+	return current;
+}
+
+static void update_resample_control_average(struct audio_monitor *monitor,
+					    uint64_t now)
+{
+	const double total_ms = bytes_to_ms(monitor, total_buffered_size(monitor));
+
+	if (!monitor->resample_control_last_ns) {
+		monitor->resample_control_last_ns = now;
+		monitor->resample_control_total_ms = RESAMPLE_TARGET_TOTAL_MS;
+	}
+
+	const double elapsed_sec =
+		(double)(now - monitor->resample_control_last_ns) /
+		1000000000.0;
+	const double alpha =
+		elapsed_sec /
+		(RESAMPLE_CONTROL_SMOOTHING_SEC + elapsed_sec);
+	monitor->resample_control_total_ms +=
+		(total_ms - monitor->resample_control_total_ms) * alpha;
+	monitor->resample_control_last_ns = now;
+}
+
+static void maybe_adjust_resampler(struct audio_monitor *monitor, uint64_t now)
+{
+	update_resample_control_average(monitor, now);
+
+	if (!monitor->resampler || !monitor->resample_control_start_ns ||
+	    now - monitor->resample_control_start_ns <
+		    RESAMPLE_CONTROL_SETTLE_NS)
+		return;
+	if (monitor->last_resample_adjust_ns &&
+	    now - monitor->last_resample_adjust_ns <
+		    RESAMPLE_CONTROL_INTERVAL_NS)
+		return;
+
+	monitor->last_resample_adjust_ns = now;
+	const int desired = desired_resample_adjust_hz(monitor);
+	const int next =
+		ramp_resample_adjust_hz(monitor->resample_adjust_hz, desired);
+	if (next == monitor->resample_adjust_hz)
+		return;
+
+	const int previous = monitor->resample_adjust_hz;
+	if (!create_resampler(monitor, next))
+		return;
+
+	blog(LOG_INFO,
+	     "AudioMonitorDriftEvent event=\"resample_adjust\" device=\"%s\" "
+	     "id=\"%s\" source=\"%s\" previous_hz=%d adjust_hz=%d "
+	     "desired_hz=%d ppm=%.2f control_total_ms=%.2f total_ms=%.2f "
+	     "queued_ms=%.2f audioqueue_ms=%.2f reconfigs=%llu",
+	     monitor->device_name ? monitor->device_name : "",
+	     monitor->device_id ? monitor->device_id : "",
+	     monitor->source_name ? monitor->source_name : "", previous, next,
+	     desired, resample_adjust_ppm(monitor),
+	     monitor->resample_control_total_ms,
+	     bytes_to_ms(monitor, total_buffered_size(monitor)),
+	     bytes_to_ms(monitor, monitor->new_data.size),
+	     bytes_to_ms(monitor, audioqueue_buffered_size(monitor)),
+	     (unsigned long long)monitor->resampler_reconfigs);
+}
+
 static void reset_drift_window(struct drift_window *window, uint64_t now,
 			       uint64_t frames)
 {
@@ -354,6 +519,13 @@ static void reset_telemetry(struct audio_monitor *monitor, uint64_t now)
 	monitor->pauses = 0;
 	monitor->restarts = 0;
 	monitor->resample_failures = 0;
+	monitor->resampler_reconfigs = 0;
+	monitor->resampler_reconfig_failures = 0;
+	monitor->resample_adjust_hz = 0;
+	monitor->resample_control_start_ns = now;
+	monitor->resample_control_last_ns = 0;
+	monitor->last_resample_adjust_ns = 0;
+	monitor->resample_control_total_ms = RESAMPLE_TARGET_TOTAL_MS;
 	os_atomic_set_long(&monitor->skipped_trylocks, 0);
 	monitor->peak_queue_size = 0;
 	monitor->low_queue_size = SIZE_MAX;
@@ -432,7 +604,10 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	     "ppm_60s=%.2f ppm_10m=%.2f input_frames=%llu enqueued_frames=%llu "
 	     "underruns=%llu fill_waits=%llu padded_buffers=%llu "
 	     "padded_frames=%llu drops=%llu enqueue_failures=%llu "
-	     "pauses=%llu restarts=%llu resample_failures=%llu skipped_trylocks=%ld "
+	     "pauses=%llu restarts=%llu resample_failures=%llu "
+	     "resample_adjust_hz=%d resample_ppm=%.2f "
+	     "resample_control_ms=%.2f resampler_reconfigs=%llu "
+	     "resampler_reconfig_failures=%llu skipped_trylocks=%ld "
 	     "empty_buffers=%zu queue_buffers=%zu "
 	     "callbacks=%llu callback_ms_avg=%.3f callback_ms_min=%.3f "
 	     "callback_ms_max=%.3f audio_ts_ms_avg=%.3f audio_ts_ms_min=%.3f "
@@ -461,6 +636,10 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	     (unsigned long long)monitor->pauses,
 	     (unsigned long long)monitor->restarts,
 	     (unsigned long long)monitor->resample_failures,
+	     monitor->resample_adjust_hz, resample_adjust_ppm(monitor),
+	     monitor->resample_control_total_ms,
+	     (unsigned long long)monitor->resampler_reconfigs,
+	     (unsigned long long)monitor->resampler_reconfig_failures,
 	     os_atomic_load_long(&monitor->skipped_trylocks),
 	     empty_buffer_count(monitor), audioqueue_buffer_count(monitor),
 	     (unsigned long long)monitor->queue_callbacks, callback_avg_ms,
@@ -499,6 +678,14 @@ static void audio_monitor_reset(struct audio_monitor *audio_monitor)
 	audio_monitor->bytes_per_frame = 0;
 	audio_monitor->sample_rate = 0;
 	audio_monitor->device_sample_rate = 0;
+	audio_monitor->speakers = SPEAKERS_UNKNOWN;
+	audio_monitor->resample_adjust_hz = 0;
+	audio_monitor->resampler_reconfigs = 0;
+	audio_monitor->resampler_reconfig_failures = 0;
+	audio_monitor->resample_control_start_ns = 0;
+	audio_monitor->resample_control_last_ns = 0;
+	audio_monitor->last_resample_adjust_ns = 0;
+	audio_monitor->resample_control_total_ms = RESAMPLE_TARGET_TOTAL_MS;
 }
 
 static inline bool enqueue_buffer(struct audio_monitor *monitor,
@@ -705,10 +892,11 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 
 	audio_monitor_reset(audio_monitor);
 
-    const struct audio_output_info *info =
+	const struct audio_output_info *info =
 		audio_output_get_info(obs_get_audio());
-    audio_monitor->channels = get_audio_channels(info->speakers);
+	audio_monitor->channels = get_audio_channels(info->speakers);
 	audio_monitor->sample_rate = info->samples_per_sec;
+	audio_monitor->speakers = info->speakers;
 	audio_monitor->device_sample_rate =
 		get_device_sample_rate(audio_monitor->device_id,
 				       info->samples_per_sec);
@@ -766,14 +954,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 				    &audio_monitor->buffers[i],
 				    sizeof(audio_monitor->buffers[i]));
 	}
-	struct resample_info from = {.samples_per_sec = info->samples_per_sec,
-				     .speakers = info->speakers,
-				     .format = AUDIO_FORMAT_FLOAT_PLANAR};
-	struct resample_info to = {.samples_per_sec = info->samples_per_sec,
-				   .speakers = info->speakers,
-				   .format = AUDIO_FORMAT_FLOAT};
-	audio_monitor->resampler = audio_resampler_create(&to, &from);
-	if (!audio_monitor->resampler)
+	if (!create_resampler(audio_monitor, 0))
 		goto fail;
 
 	stat = AudioQueueStart(audio_monitor->queue, NULL);
@@ -785,7 +966,8 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 	blog(LOG_INFO,
 	     "AudioMonitorDriftStart device=\"%s\" id=\"%s\" source=\"%s\" "
 	     "sample_rate=%u device_sample_rate=%u channels=%u buffer_ms=%.2f "
-	     "wait_ms=%.2f queue_buffers=%u",
+	     "wait_ms=%.2f queue_buffers=%u resample_target_ms=%.2f "
+	     "resample_max_adjust_hz=%d",
 	     audio_monitor->device_name ? audio_monitor->device_name : "",
 	     audio_monitor->device_id ? audio_monitor->device_id : "",
 	     audio_monitor->source_name ? audio_monitor->source_name : "",
@@ -793,7 +975,8 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 	     audio_monitor->channels,
 	     bytes_to_ms(audio_monitor, audio_monitor->buffer_size),
 	     bytes_to_ms(audio_monitor, audio_monitor->wait_size),
-	     (unsigned)AUDIO_QUEUE_BUFFER_COUNT);
+	     (unsigned)AUDIO_QUEUE_BUFFER_COUNT, RESAMPLE_TARGET_TOTAL_MS,
+	     RESAMPLE_MAX_ADJUST_HZ);
 	pthread_mutex_unlock(&audio_monitor->mutex);
 	return;
 
@@ -894,6 +1077,7 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio){
 	deque_push_back(&audio_monitor->new_data, resample_data[0], bytes);
 	audio_monitor->input_frames += resample_frames;
 	update_queue_watermarks(audio_monitor);
+	maybe_adjust_resampler(audio_monitor, os_gettime_ns());
 	if (audio_monitor->new_data.size >= audio_monitor->wait_size) {
 		audio_monitor->wait_size = 0;
 
