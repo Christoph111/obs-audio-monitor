@@ -360,6 +360,7 @@ static bool create_resampler(struct audio_monitor *monitor, int adjust_hz)
 static int desired_resample_adjust_hz(const struct audio_monitor *monitor)
 {
 	const double total_ms = monitor->resample_control_total_ms;
+	const double queued_ms = bytes_to_ms(monitor, monitor->new_data.size);
 
 	if (total_ms < 90.0)
 		return 8;
@@ -369,13 +370,16 @@ static int desired_resample_adjust_hz(const struct audio_monitor *monitor)
 		return 4;
 	if (total_ms < 165.0)
 		return 2;
-	if (total_ms > 300.0)
+
+	/* A full AudioQueue is intended reserve. Slow down only if the
+	 * software queue itself grows beyond the normal one-buffer jitter. */
+	if (queued_ms > 240.0)
 		return -8;
-	if (total_ms > 270.0)
+	if (queued_ms > 180.0)
 		return -6;
-	if (total_ms > 240.0)
+	if (queued_ms > 120.0)
 		return -4;
-	if (total_ms > 220.0)
+	if (queued_ms > 90.0)
 		return -2;
 
 	return 0;
