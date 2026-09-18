@@ -339,6 +339,8 @@ static double delta_avg_ms(uint64_t total, uint64_t count)
 static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 			  bool force)
 {
+	if (!force && now <= monitor->last_log_ns)
+		return;
 	if (!force && now - monitor->last_log_ns < DRIFT_LOG_INTERVAL_NS)
 		return;
 
@@ -450,7 +452,6 @@ static inline bool fill_buffer(struct audio_monitor *monitor)
 		monitor->bytes_per_frame
 			? monitor->buffer_size / monitor->bytes_per_frame
 			: 0;
-	log_telemetry(monitor, os_gettime_ns(), false);
 	return true;
 }
 
@@ -486,7 +487,7 @@ static void buffer_audio(void *data, AudioQueueRef aq, AudioQueueBufferRef buf)
 		monitor->pauses++;
 		AudioQueuePause(monitor->queue);
 	}
-	log_telemetry(monitor, now, false);
+	log_telemetry(monitor, os_gettime_ns(), false);
 	pthread_mutex_unlock(&monitor->mutex);
 
 	UNUSED_PARAMETER(aq);
