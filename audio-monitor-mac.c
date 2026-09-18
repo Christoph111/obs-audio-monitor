@@ -87,6 +87,27 @@ struct audio_monitor {
 	struct drift_window drift_windows[3];
 };
 
+static bool monitor_success_(struct audio_monitor *monitor, OSStatus stat,
+			     const char *func, const char *call)
+{
+	if (stat != noErr) {
+		blog(LOG_WARNING,
+		     "%s: %s failed for device=\"%s\" id=\"%s\" source=\"%s\" "
+		     "status=%d sample_rate=%u device_sample_rate=%u channels=%u",
+		     func, call, monitor->device_name ? monitor->device_name : "",
+		     monitor->device_id ? monitor->device_id : "",
+		     monitor->source_name ? monitor->source_name : "", (int)stat,
+		     monitor->sample_rate, monitor->device_sample_rate,
+		     monitor->channels);
+		return false;
+	}
+
+	return true;
+}
+
+#define monitor_success(monitor, stat, call) \
+	monitor_success_(monitor, stat, __FUNCTION__, call)
+
 struct device_name_lookup {
 	const char *id;
 	char *name;
@@ -569,7 +590,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 	OSStatus stat = AudioQueueNewOutput(&desc, buffer_audio, audio_monitor,
 					    NULL, NULL, 0,
 					    &audio_monitor->queue);
-	if (!success(stat, "AudioQueueNewOutput"))
+	if (!monitor_success(audio_monitor, stat, "AudioQueueNewOutput"))
 		goto fail;
 
 	if (strcmp(audio_monitor->device_id, "default") != 0) {
@@ -582,19 +603,20 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 					     kAudioQueueProperty_CurrentDevice,
 					     &cf_uid, sizeof(cf_uid));
 		CFRelease(cf_uid);
-		if (!success(stat, "set current device"))
+		if (!monitor_success(audio_monitor, stat, "set current device"))
 			goto fail;
 	}
 	stat = AudioQueueSetParameter(audio_monitor->queue,
 				      kAudioQueueParam_Volume, 1.0);
-	if (!success(stat, "set volume"))
+	if (!monitor_success(audio_monitor, stat, "set volume"))
 		goto fail;
 
 	for (size_t i = 0; i < 3; i++) {
 		stat = AudioQueueAllocateBuffer(audio_monitor->queue,
 						audio_monitor->buffer_size,
 						&audio_monitor->buffers[i]);
-		if (!success(stat, "allocation of buffer"))
+		if (!monitor_success(audio_monitor, stat,
+				     "allocation of buffer"))
 			goto fail;
 
 		deque_push_back(&audio_monitor->empty_buffers,
@@ -612,7 +634,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 		goto fail;
 
 	stat = AudioQueueStart(audio_monitor->queue, NULL);
-	if (!success(stat, "start"))
+	if (!monitor_success(audio_monitor, stat, "start"))
 		goto fail;
 
 	audio_monitor->active = true;
