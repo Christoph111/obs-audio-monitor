@@ -5,6 +5,7 @@
 #include <CoreFoundation/CFString.h>
 #include <CoreAudio/CoreAudio.h>
 #include <stdint.h>
+#include <string.h>
 #include <util/deque.h>
 #include <obs-module.h>
 
@@ -17,7 +18,8 @@
 #define DRIFT_WINDOW_10S_NS 10000000000ULL
 #define DRIFT_WINDOW_60S_NS 60000000000ULL
 #define DRIFT_WINDOW_10M_NS 600000000000ULL
-#define AUDIO_QUEUE_BUFFER_COUNT 6
+#define AUDIO_QUEUE_BUFFER_COUNT 8
+#define AUDIO_QUEUE_MIN_BUFFER_COUNT 2
 
 struct drift_window {
 	uint64_t duration_ns;
@@ -67,6 +69,8 @@ struct audio_monitor {
 	uint64_t queue_callbacks;
 	uint64_t underruns;
 	uint64_t fill_waits;
+	uint64_t padded_buffers;
+	uint64_t padded_frames;
 	uint64_t dropped_frames;
 	uint64_t enqueue_failures;
 	uint64_t pauses;
@@ -343,6 +347,8 @@ static void reset_telemetry(struct audio_monitor *monitor, uint64_t now)
 	monitor->queue_callbacks = 0;
 	monitor->underruns = 0;
 	monitor->fill_waits = 0;
+	monitor->padded_buffers = 0;
+	monitor->padded_frames = 0;
 	monitor->dropped_frames = 0;
 	monitor->enqueue_failures = 0;
 	monitor->pauses = 0;
@@ -424,7 +430,8 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	     "queued_frames=%llu audioqueue_ms=%.2f total_ms=%.2f peak_ms=%.2f "
 	     "low_ms=%.2f total_peak_ms=%.2f total_low_ms=%.2f ppm_10s=%.2f "
 	     "ppm_60s=%.2f ppm_10m=%.2f input_frames=%llu enqueued_frames=%llu "
-	     "underruns=%llu fill_waits=%llu drops=%llu enqueue_failures=%llu "
+	     "underruns=%llu fill_waits=%llu padded_buffers=%llu "
+	     "padded_frames=%llu drops=%llu enqueue_failures=%llu "
 	     "pauses=%llu restarts=%llu resample_failures=%llu skipped_trylocks=%ld "
 	     "empty_buffers=%zu queue_buffers=%zu "
 	     "callbacks=%llu callback_ms_avg=%.3f callback_ms_min=%.3f "
@@ -447,6 +454,8 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	     (unsigned long long)monitor->enqueued_frames,
 	     (unsigned long long)monitor->underruns,
 	     (unsigned long long)monitor->fill_waits,
+	     (unsigned long long)monitor->padded_buffers,
+	     (unsigned long long)monitor->padded_frames,
 	     (unsigned long long)monitor->dropped_frames,
 	     (unsigned long long)monitor->enqueue_failures,
 	     (unsigned long long)monitor->pauses,
@@ -492,10 +501,30 @@ static void audio_monitor_reset(struct audio_monitor *audio_monitor)
 	audio_monitor->device_sample_rate = 0;
 }
 
+static inline bool enqueue_buffer(struct audio_monitor *monitor,
+				  AudioQueueBufferRef buf)
+{
+	OSStatus stat;
+
+	stat = AudioQueueEnqueueBuffer(monitor->queue, buf, 0, NULL);
+	if (!success(stat, "AudioQueueEnqueueBuffer")) {
+		blog(LOG_WARNING, "%s: %s", __FUNCTION__,
+		     "Failed to enqueue buffer");
+		monitor->enqueue_failures++;
+		monitor->active = false;
+		AudioQueueStop(monitor->queue, false);
+		return false;
+	}
+	monitor->enqueued_frames +=
+		monitor->bytes_per_frame
+			? monitor->buffer_size / monitor->bytes_per_frame
+			: 0;
+	return true;
+}
+
 static inline bool fill_buffer(struct audio_monitor *monitor)
 {
 	AudioQueueBufferRef buf;
-	OSStatus stat;
 
 	if (monitor->new_data.size < monitor->buffer_size) {
 		monitor->fill_waits++;
@@ -509,18 +538,59 @@ static inline bool fill_buffer(struct audio_monitor *monitor)
 
 	buf->mAudioDataByteSize = monitor->buffer_size;
 
-	stat = AudioQueueEnqueueBuffer(monitor->queue, buf, 0, NULL);
-	if (!success(stat, "AudioQueueEnqueueBuffer")) {
-		blog(LOG_WARNING, "%s: %s", __FUNCTION__,
-		     "Failed to enqueue buffer");
-		monitor->enqueue_failures++;
-		monitor->active = false;
-		AudioQueueStop(monitor->queue, false);
-	}
-	monitor->enqueued_frames +=
-		monitor->bytes_per_frame
-			? monitor->buffer_size / monitor->bytes_per_frame
-			: 0;
+	return enqueue_buffer(monitor, buf);
+}
+
+static inline bool fill_padding_buffer(struct audio_monitor *monitor)
+{
+	AudioQueueBufferRef buf;
+	const size_t copy_size = monitor->new_data.size < monitor->buffer_size
+					 ? monitor->new_data.size
+					 : monitor->buffer_size;
+
+	if (monitor->empty_buffers.size == 0)
+		return false;
+
+	deque_pop_front(&monitor->empty_buffers, &buf, sizeof(buf));
+	if (copy_size > 0)
+		deque_pop_front(&monitor->new_data, buf->mAudioData, copy_size);
+	memset((uint8_t *)buf->mAudioData + copy_size, 0,
+	       monitor->buffer_size - copy_size);
+	update_queue_watermarks(monitor);
+
+	buf->mAudioDataByteSize = monitor->buffer_size;
+	monitor->padded_buffers++;
+	monitor->padded_frames += monitor->bytes_per_frame
+					  ? (monitor->buffer_size - copy_size) /
+						    monitor->bytes_per_frame
+					  : 0;
+
+	return enqueue_buffer(monitor, buf);
+}
+
+static inline bool maybe_fill_padding_buffer(struct audio_monitor *monitor,
+					     const char *trigger)
+{
+	if (audioqueue_buffer_count(monitor) > AUDIO_QUEUE_MIN_BUFFER_COUNT)
+		return false;
+	if (!fill_padding_buffer(monitor))
+		return false;
+
+	blog(LOG_WARNING,
+	     "AudioMonitorDriftEvent event=\"pad\" trigger=\"%s\" device=\"%s\" "
+	     "id=\"%s\" source=\"%s\" queued_ms=%.2f audioqueue_ms=%.2f "
+	     "total_ms=%.2f fill_waits=%llu padded_buffers=%llu "
+	     "padded_frames=%llu empty_buffers=%zu queue_buffers=%zu",
+	     trigger, monitor->device_name ? monitor->device_name : "",
+	     monitor->device_id ? monitor->device_id : "",
+	     monitor->source_name ? monitor->source_name : "",
+	     bytes_to_ms(monitor, monitor->new_data.size),
+	     bytes_to_ms(monitor, audioqueue_buffered_size(monitor)),
+	     bytes_to_ms(monitor, total_buffered_size(monitor)),
+	     (unsigned long long)monitor->fill_waits,
+	     (unsigned long long)monitor->padded_buffers,
+	     (unsigned long long)monitor->padded_frames,
+	     empty_buffer_count(monitor), audioqueue_buffer_count(monitor));
 	return true;
 }
 
@@ -547,6 +617,8 @@ static void buffer_audio(void *data, AudioQueueRef aq, AudioQueueBufferRef buf)
 	deque_push_back(&monitor->empty_buffers, &buf, sizeof(buf));
 	while (monitor->empty_buffers.size > 0) {
 		if (!fill_buffer(monitor)) {
+			if (maybe_fill_padding_buffer(monitor, "callback"))
+				continue;
 			break;
 		}
 	}
@@ -560,7 +632,8 @@ static void buffer_audio(void *data, AudioQueueRef aq, AudioQueueBufferRef buf)
 		     "AudioMonitorDriftEvent event=\"pause\" device=\"%s\" "
 		     "id=\"%s\" source=\"%s\" queued_ms=%.2f "
 		     "audioqueue_ms=%.2f total_ms=%.2f fill_waits=%llu "
-		     "underruns=%llu pauses=%llu callbacks=%llu "
+		     "padded_buffers=%llu padded_frames=%llu underruns=%llu "
+		     "pauses=%llu callbacks=%llu "
 		     "empty_buffers=%zu queue_buffers=%zu",
 		     monitor->device_name ? monitor->device_name : "",
 		     monitor->device_id ? monitor->device_id : "",
@@ -569,6 +642,8 @@ static void buffer_audio(void *data, AudioQueueRef aq, AudioQueueBufferRef buf)
 		     bytes_to_ms(monitor, audioqueue_buffered_size(monitor)),
 		     bytes_to_ms(monitor, total_buffered_size(monitor)),
 		     (unsigned long long)monitor->fill_waits,
+		     (unsigned long long)monitor->padded_buffers,
+		     (unsigned long long)monitor->padded_frames,
 		     (unsigned long long)monitor->underruns,
 		     (unsigned long long)monitor->pauses,
 		     (unsigned long long)monitor->queue_callbacks,
@@ -824,6 +899,8 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio){
 
 		while (audio_monitor->empty_buffers.size > 0) {
 			if (!fill_buffer(audio_monitor)) {
+				if (maybe_fill_padding_buffer(audio_monitor, "input"))
+					continue;
 				break;
 			}
 		}
@@ -838,6 +915,7 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio){
 				     "device=\"%s\" id=\"%s\" source=\"%s\" "
 				     "queued_ms=%.2f audioqueue_ms=%.2f "
 				     "total_ms=%.2f fill_waits=%llu "
+				     "padded_buffers=%llu padded_frames=%llu "
 				     "underruns=%llu pauses=%llu restarts=%llu "
 				     "empty_buffers=%zu queue_buffers=%zu",
 				     audio_monitor->device_name
@@ -856,6 +934,8 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio){
 				     bytes_to_ms(audio_monitor,
 						 total_buffered_size(audio_monitor)),
 				     (unsigned long long)audio_monitor->fill_waits,
+				     (unsigned long long)audio_monitor->padded_buffers,
+				     (unsigned long long)audio_monitor->padded_frames,
 				     (unsigned long long)audio_monitor->underruns,
 				     (unsigned long long)audio_monitor->pauses,
 				     (unsigned long long)audio_monitor->restarts,
