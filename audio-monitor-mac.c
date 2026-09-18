@@ -17,6 +17,7 @@
 #define DRIFT_WINDOW_10S_NS 10000000000ULL
 #define DRIFT_WINDOW_60S_NS 60000000000ULL
 #define DRIFT_WINDOW_10M_NS 600000000000ULL
+#define AUDIO_QUEUE_BUFFER_COUNT 6
 
 struct drift_window {
 	uint64_t duration_ns;
@@ -39,7 +40,7 @@ static bool success_(OSStatus stat, const char *func, const char *call)
 
 struct audio_monitor {
 	AudioQueueRef queue;
-	AudioQueueBufferRef buffers[3];
+	AudioQueueBufferRef buffers[AUDIO_QUEUE_BUFFER_COUNT];
 	size_t buffer_size;
 	size_t wait_size;
 	size_t bytes_per_frame;
@@ -65,6 +66,7 @@ struct audio_monitor {
 	uint64_t enqueued_frames;
 	uint64_t queue_callbacks;
 	uint64_t underruns;
+	uint64_t fill_waits;
 	uint64_t dropped_frames;
 	uint64_t enqueue_failures;
 	uint64_t pauses;
@@ -73,6 +75,8 @@ struct audio_monitor {
 	volatile long skipped_trylocks;
 	size_t peak_queue_size;
 	size_t low_queue_size;
+	size_t peak_total_buffer_size;
+	size_t low_total_buffer_size;
 	uint64_t last_audio_timestamp_ns;
 	uint64_t audio_timestamp_delta_min_ns;
 	uint64_t audio_timestamp_delta_max_ns;
@@ -245,6 +249,27 @@ static uint64_t queued_frames(const struct audio_monitor *monitor)
 	return (uint64_t)(monitor->new_data.size / monitor->bytes_per_frame);
 }
 
+static size_t empty_buffer_count(const struct audio_monitor *monitor)
+{
+	return monitor->empty_buffers.size / sizeof(AudioQueueBufferRef);
+}
+
+static size_t audioqueue_buffer_count(const struct audio_monitor *monitor)
+{
+	const size_t empty = empty_buffer_count(monitor);
+	return empty > AUDIO_QUEUE_BUFFER_COUNT ? 0 : AUDIO_QUEUE_BUFFER_COUNT - empty;
+}
+
+static size_t audioqueue_buffered_size(const struct audio_monitor *monitor)
+{
+	return audioqueue_buffer_count(monitor) * monitor->buffer_size;
+}
+
+static size_t total_buffered_size(const struct audio_monitor *monitor)
+{
+	return monitor->new_data.size + audioqueue_buffered_size(monitor);
+}
+
 static double frames_to_ms(const struct audio_monitor *monitor,
 			   uint64_t frames)
 {
@@ -299,10 +324,16 @@ static void update_drift_windows(struct audio_monitor *monitor, uint64_t now)
 static void update_queue_watermarks(struct audio_monitor *monitor)
 {
 	const size_t size = monitor->new_data.size;
+	const size_t total_size = total_buffered_size(monitor);
 	if (size > monitor->peak_queue_size)
 		monitor->peak_queue_size = size;
 	if (monitor->low_queue_size == SIZE_MAX || size < monitor->low_queue_size)
 		monitor->low_queue_size = size;
+	if (total_size > monitor->peak_total_buffer_size)
+		monitor->peak_total_buffer_size = total_size;
+	if (monitor->low_total_buffer_size == SIZE_MAX ||
+	    total_size < monitor->low_total_buffer_size)
+		monitor->low_total_buffer_size = total_size;
 }
 
 static void reset_telemetry(struct audio_monitor *monitor, uint64_t now)
@@ -311,6 +342,7 @@ static void reset_telemetry(struct audio_monitor *monitor, uint64_t now)
 	monitor->enqueued_frames = 0;
 	monitor->queue_callbacks = 0;
 	monitor->underruns = 0;
+	monitor->fill_waits = 0;
 	monitor->dropped_frames = 0;
 	monitor->enqueue_failures = 0;
 	monitor->pauses = 0;
@@ -319,6 +351,8 @@ static void reset_telemetry(struct audio_monitor *monitor, uint64_t now)
 	os_atomic_set_long(&monitor->skipped_trylocks, 0);
 	monitor->peak_queue_size = 0;
 	monitor->low_queue_size = SIZE_MAX;
+	monitor->peak_total_buffer_size = 0;
+	monitor->low_total_buffer_size = SIZE_MAX;
 	monitor->last_audio_timestamp_ns = 0;
 	monitor->audio_timestamp_delta_min_ns = 0;
 	monitor->audio_timestamp_delta_max_ns = 0;
@@ -371,6 +405,12 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	const size_t low_queue_size =
 		monitor->low_queue_size == SIZE_MAX ? monitor->new_data.size
 						    : monitor->low_queue_size;
+	const size_t audioqueue_size = audioqueue_buffered_size(monitor);
+	const size_t total_size = total_buffered_size(monitor);
+	const size_t low_total_size =
+		monitor->low_total_buffer_size == SIZE_MAX
+			? total_size
+			: monitor->low_total_buffer_size;
 	const double callback_avg_ms =
 		delta_avg_ms(monitor->callback_delta_total_ns,
 			     monitor->callback_delta_count);
@@ -381,10 +421,12 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	blog(LOG_INFO,
 	     "AudioMonitorDrift device=\"%s\" id=\"%s\" source=\"%s\" "
 	     "sample_rate=%u device_sample_rate=%u channels=%u queued_ms=%.2f "
-	     "queued_frames=%llu peak_ms=%.2f low_ms=%.2f ppm_10s=%.2f "
+	     "queued_frames=%llu audioqueue_ms=%.2f total_ms=%.2f peak_ms=%.2f "
+	     "low_ms=%.2f total_peak_ms=%.2f total_low_ms=%.2f ppm_10s=%.2f "
 	     "ppm_60s=%.2f ppm_10m=%.2f input_frames=%llu enqueued_frames=%llu "
-	     "underruns=%llu drops=%llu enqueue_failures=%llu pauses=%llu "
-	     "restarts=%llu resample_failures=%llu skipped_trylocks=%ld "
+	     "underruns=%llu fill_waits=%llu drops=%llu enqueue_failures=%llu "
+	     "pauses=%llu restarts=%llu resample_failures=%llu skipped_trylocks=%ld "
+	     "empty_buffers=%zu queue_buffers=%zu "
 	     "callbacks=%llu callback_ms_avg=%.3f callback_ms_min=%.3f "
 	     "callback_ms_max=%.3f audio_ts_ms_avg=%.3f audio_ts_ms_min=%.3f "
 	     "audio_ts_ms_max=%.3f",
@@ -393,19 +435,25 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	     monitor->source_name ? monitor->source_name : "",
 	     monitor->sample_rate, monitor->device_sample_rate, monitor->channels,
 	     frames_to_ms(monitor, frames), (unsigned long long)frames,
+	     bytes_to_ms(monitor, audioqueue_size),
+	     bytes_to_ms(monitor, total_size),
 	     bytes_to_ms(monitor, monitor->peak_queue_size),
 	     bytes_to_ms(monitor, low_queue_size),
+	     bytes_to_ms(monitor, monitor->peak_total_buffer_size),
+	     bytes_to_ms(monitor, low_total_size),
 	     monitor->drift_windows[0].ppm, monitor->drift_windows[1].ppm,
 	     monitor->drift_windows[2].ppm,
 	     (unsigned long long)monitor->input_frames,
 	     (unsigned long long)monitor->enqueued_frames,
 	     (unsigned long long)monitor->underruns,
+	     (unsigned long long)monitor->fill_waits,
 	     (unsigned long long)monitor->dropped_frames,
 	     (unsigned long long)monitor->enqueue_failures,
 	     (unsigned long long)monitor->pauses,
 	     (unsigned long long)monitor->restarts,
 	     (unsigned long long)monitor->resample_failures,
 	     os_atomic_load_long(&monitor->skipped_trylocks),
+	     empty_buffer_count(monitor), audioqueue_buffer_count(monitor),
 	     (unsigned long long)monitor->queue_callbacks, callback_avg_ms,
 	     (double)monitor->callback_delta_min_ns / 1000000.0,
 	     (double)monitor->callback_delta_max_ns / 1000000.0,
@@ -419,7 +467,7 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 static void audio_monitor_reset(struct audio_monitor *audio_monitor)
 {
 	if (audio_monitor->queue) {
-		for (size_t i = 0; i < 3; i++) {
+		for (size_t i = 0; i < AUDIO_QUEUE_BUFFER_COUNT; i++) {
 			if (audio_monitor->buffers[i]) {
 				AudioQueueFreeBuffer(audio_monitor->queue,
 						     audio_monitor->buffers[i]);
@@ -450,7 +498,7 @@ static inline bool fill_buffer(struct audio_monitor *monitor)
 	OSStatus stat;
 
 	if (monitor->new_data.size < monitor->buffer_size) {
-		monitor->underruns++;
+		monitor->fill_waits++;
 		return false;
 	}
 
@@ -502,10 +550,29 @@ static void buffer_audio(void *data, AudioQueueRef aq, AudioQueueBufferRef buf)
 			break;
 		}
 	}
-	if (monitor->empty_buffers.size == sizeof(buf) * 3) {
+	if (empty_buffer_count(monitor) == AUDIO_QUEUE_BUFFER_COUNT) {
 		monitor->paused = true;
-		monitor->wait_size = monitor->buffer_size * 3;
+		monitor->wait_size =
+			monitor->buffer_size * AUDIO_QUEUE_BUFFER_COUNT;
+		monitor->underruns++;
 		monitor->pauses++;
+		blog(LOG_WARNING,
+		     "AudioMonitorDriftEvent event=\"pause\" device=\"%s\" "
+		     "id=\"%s\" source=\"%s\" queued_ms=%.2f "
+		     "audioqueue_ms=%.2f total_ms=%.2f fill_waits=%llu "
+		     "underruns=%llu pauses=%llu callbacks=%llu "
+		     "empty_buffers=%zu queue_buffers=%zu",
+		     monitor->device_name ? monitor->device_name : "",
+		     monitor->device_id ? monitor->device_id : "",
+		     monitor->source_name ? monitor->source_name : "",
+		     bytes_to_ms(monitor, monitor->new_data.size),
+		     bytes_to_ms(monitor, audioqueue_buffered_size(monitor)),
+		     bytes_to_ms(monitor, total_buffered_size(monitor)),
+		     (unsigned long long)monitor->fill_waits,
+		     (unsigned long long)monitor->underruns,
+		     (unsigned long long)monitor->pauses,
+		     (unsigned long long)monitor->queue_callbacks,
+		     empty_buffer_count(monitor), audioqueue_buffer_count(monitor));
 		AudioQueuePause(monitor->queue);
 	}
 	log_telemetry(monitor, os_gettime_ns(), false);
@@ -574,7 +641,8 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 		audio_monitor->channels * sizeof(float);
 	audio_monitor->buffer_size = audio_monitor->bytes_per_frame *
 				     info->samples_per_sec / 100 * 3;
-	audio_monitor->wait_size = audio_monitor->buffer_size * 3;
+	audio_monitor->wait_size =
+		audio_monitor->buffer_size * AUDIO_QUEUE_BUFFER_COUNT;
 	reset_telemetry(audio_monitor, now);
 	AudioStreamBasicDescription desc = {
 		.mSampleRate = (Float64)info->samples_per_sec,
@@ -611,7 +679,7 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 	if (!monitor_success(audio_monitor, stat, "set volume"))
 		goto fail;
 
-	for (size_t i = 0; i < 3; i++) {
+	for (size_t i = 0; i < AUDIO_QUEUE_BUFFER_COUNT; i++) {
 		stat = AudioQueueAllocateBuffer(audio_monitor->queue,
 						audio_monitor->buffer_size,
 						&audio_monitor->buffers[i]);
@@ -642,14 +710,15 @@ void audio_monitor_start(struct audio_monitor *audio_monitor){
 	blog(LOG_INFO,
 	     "AudioMonitorDriftStart device=\"%s\" id=\"%s\" source=\"%s\" "
 	     "sample_rate=%u device_sample_rate=%u channels=%u buffer_ms=%.2f "
-	     "wait_ms=%.2f",
+	     "wait_ms=%.2f queue_buffers=%u",
 	     audio_monitor->device_name ? audio_monitor->device_name : "",
 	     audio_monitor->device_id ? audio_monitor->device_id : "",
 	     audio_monitor->source_name ? audio_monitor->source_name : "",
 	     audio_monitor->sample_rate, audio_monitor->device_sample_rate,
 	     audio_monitor->channels,
 	     bytes_to_ms(audio_monitor, audio_monitor->buffer_size),
-	     bytes_to_ms(audio_monitor, audio_monitor->wait_size));
+	     bytes_to_ms(audio_monitor, audio_monitor->wait_size),
+	     (unsigned)AUDIO_QUEUE_BUFFER_COUNT);
 	pthread_mutex_unlock(&audio_monitor->mutex);
 	return;
 
@@ -764,6 +833,34 @@ void audio_monitor_audio(void *data, struct obs_audio_data *audio){
 			if (success(stat, "restart")) {
 				audio_monitor->paused = false;
 				audio_monitor->restarts++;
+				blog(LOG_WARNING,
+				     "AudioMonitorDriftEvent event=\"restart\" "
+				     "device=\"%s\" id=\"%s\" source=\"%s\" "
+				     "queued_ms=%.2f audioqueue_ms=%.2f "
+				     "total_ms=%.2f fill_waits=%llu "
+				     "underruns=%llu pauses=%llu restarts=%llu "
+				     "empty_buffers=%zu queue_buffers=%zu",
+				     audio_monitor->device_name
+					     ? audio_monitor->device_name
+					     : "",
+				     audio_monitor->device_id ? audio_monitor->device_id
+							      : "",
+				     audio_monitor->source_name
+					     ? audio_monitor->source_name
+					     : "",
+				     bytes_to_ms(audio_monitor,
+						 audio_monitor->new_data.size),
+				     bytes_to_ms(audio_monitor,
+						 audioqueue_buffered_size(
+							 audio_monitor)),
+				     bytes_to_ms(audio_monitor,
+						 total_buffered_size(audio_monitor)),
+				     (unsigned long long)audio_monitor->fill_waits,
+				     (unsigned long long)audio_monitor->underruns,
+				     (unsigned long long)audio_monitor->pauses,
+				     (unsigned long long)audio_monitor->restarts,
+				     empty_buffer_count(audio_monitor),
+				     audioqueue_buffer_count(audio_monitor));
 			} else {
 				audio_monitor->active = false;
 			}
