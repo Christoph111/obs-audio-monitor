@@ -26,6 +26,7 @@
 #define RESAMPLE_TARGET_TOTAL_MS 180.0
 #define RESAMPLE_RAMP_STEP_HZ 1
 #define RESAMPLE_MAX_ADJUST_HZ 8
+#define RESAMPLE_PAD_BOOST_NS 300000000000ULL
 
 struct drift_window {
 	uint64_t duration_ns;
@@ -69,6 +70,9 @@ struct audio_monitor {
 	uint64_t resample_control_start_ns;
 	uint64_t resample_control_last_ns;
 	uint64_t last_resample_adjust_ns;
+	uint64_t last_resample_control_padded_buffers;
+	uint64_t resample_pad_boost_until_ns;
+	int resample_pad_boost_hz;
 	double resample_control_total_ms;
 	float volume;
 	bool mono;
@@ -357,10 +361,14 @@ static bool create_resampler(struct audio_monitor *monitor, int adjust_hz)
 	return true;
 }
 
-static int desired_resample_adjust_hz(const struct audio_monitor *monitor)
+static int desired_resample_adjust_hz(const struct audio_monitor *monitor,
+				      uint64_t now)
 {
 	const double total_ms = monitor->resample_control_total_ms;
 	const double queued_ms = bytes_to_ms(monitor, monitor->new_data.size);
+	const bool pad_boost_active =
+		monitor->resample_pad_boost_until_ns &&
+		now < monitor->resample_pad_boost_until_ns;
 
 	if (total_ms < 90.0)
 		return 8;
@@ -381,6 +389,8 @@ static int desired_resample_adjust_hz(const struct audio_monitor *monitor)
 		return -4;
 	if (queued_ms > 90.0)
 		return -2;
+	if (pad_boost_active)
+		return monitor->resample_pad_boost_hz;
 
 	return 0;
 }
@@ -435,7 +445,23 @@ static void maybe_adjust_resampler(struct audio_monitor *monitor, uint64_t now)
 		return;
 
 	monitor->last_resample_adjust_ns = now;
-	const int desired = desired_resample_adjust_hz(monitor);
+	const uint64_t padded_delta =
+		monitor->padded_buffers -
+		monitor->last_resample_control_padded_buffers;
+	monitor->last_resample_control_padded_buffers =
+		monitor->padded_buffers;
+	if (padded_delta > 0) {
+		const int boost_hz = padded_delta > 1 ? 4 : 2;
+		if (monitor->resample_pad_boost_hz < boost_hz)
+			monitor->resample_pad_boost_hz = boost_hz;
+		monitor->resample_pad_boost_until_ns =
+			now + RESAMPLE_PAD_BOOST_NS;
+	}
+	if (monitor->resample_pad_boost_until_ns &&
+	    now >= monitor->resample_pad_boost_until_ns)
+		monitor->resample_pad_boost_hz = 0;
+
+	const int desired = desired_resample_adjust_hz(monitor, now);
 	const int next =
 		ramp_resample_adjust_hz(monitor->resample_adjust_hz, desired);
 	if (next == monitor->resample_adjust_hz)
@@ -449,7 +475,8 @@ static void maybe_adjust_resampler(struct audio_monitor *monitor, uint64_t now)
 	     "AudioMonitorDriftEvent event=\"resample_adjust\" device=\"%s\" "
 	     "id=\"%s\" source=\"%s\" previous_hz=%d adjust_hz=%d "
 	     "desired_hz=%d ppm=%.2f control_total_ms=%.2f total_ms=%.2f "
-	     "queued_ms=%.2f audioqueue_ms=%.2f reconfigs=%llu",
+	     "queued_ms=%.2f audioqueue_ms=%.2f pad_boost_hz=%d "
+	     "padded_delta=%llu reconfigs=%llu",
 	     monitor->device_name ? monitor->device_name : "",
 	     monitor->device_id ? monitor->device_id : "",
 	     monitor->source_name ? monitor->source_name : "", previous, next,
@@ -458,6 +485,8 @@ static void maybe_adjust_resampler(struct audio_monitor *monitor, uint64_t now)
 	     bytes_to_ms(monitor, total_buffered_size(monitor)),
 	     bytes_to_ms(monitor, monitor->new_data.size),
 	     bytes_to_ms(monitor, audioqueue_buffered_size(monitor)),
+	     monitor->resample_pad_boost_hz,
+	     (unsigned long long)padded_delta,
 	     (unsigned long long)monitor->resampler_reconfigs);
 }
 
@@ -529,6 +558,9 @@ static void reset_telemetry(struct audio_monitor *monitor, uint64_t now)
 	monitor->resample_control_start_ns = now;
 	monitor->resample_control_last_ns = 0;
 	monitor->last_resample_adjust_ns = 0;
+	monitor->last_resample_control_padded_buffers = 0;
+	monitor->resample_pad_boost_until_ns = 0;
+	monitor->resample_pad_boost_hz = 0;
 	monitor->resample_control_total_ms = RESAMPLE_TARGET_TOTAL_MS;
 	os_atomic_set_long(&monitor->skipped_trylocks, 0);
 	monitor->peak_queue_size = 0;
@@ -610,8 +642,9 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	     "padded_frames=%llu drops=%llu enqueue_failures=%llu "
 	     "pauses=%llu restarts=%llu resample_failures=%llu "
 	     "resample_adjust_hz=%d resample_ppm=%.2f "
-	     "resample_control_ms=%.2f resampler_reconfigs=%llu "
-	     "resampler_reconfig_failures=%llu skipped_trylocks=%ld "
+	     "resample_control_ms=%.2f resample_pad_boost_hz=%d "
+	     "resampler_reconfigs=%llu resampler_reconfig_failures=%llu "
+	     "skipped_trylocks=%ld "
 	     "empty_buffers=%zu queue_buffers=%zu "
 	     "callbacks=%llu callback_ms_avg=%.3f callback_ms_min=%.3f "
 	     "callback_ms_max=%.3f audio_ts_ms_avg=%.3f audio_ts_ms_min=%.3f "
@@ -642,6 +675,7 @@ static void log_telemetry(struct audio_monitor *monitor, uint64_t now,
 	     (unsigned long long)monitor->resample_failures,
 	     monitor->resample_adjust_hz, resample_adjust_ppm(monitor),
 	     monitor->resample_control_total_ms,
+	     monitor->resample_pad_boost_hz,
 	     (unsigned long long)monitor->resampler_reconfigs,
 	     (unsigned long long)monitor->resampler_reconfig_failures,
 	     os_atomic_load_long(&monitor->skipped_trylocks),
@@ -689,6 +723,9 @@ static void audio_monitor_reset(struct audio_monitor *audio_monitor)
 	audio_monitor->resample_control_start_ns = 0;
 	audio_monitor->resample_control_last_ns = 0;
 	audio_monitor->last_resample_adjust_ns = 0;
+	audio_monitor->last_resample_control_padded_buffers = 0;
+	audio_monitor->resample_pad_boost_until_ns = 0;
+	audio_monitor->resample_pad_boost_hz = 0;
 	audio_monitor->resample_control_total_ms = RESAMPLE_TARGET_TOTAL_MS;
 }
 
